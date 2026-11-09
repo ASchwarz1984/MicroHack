@@ -82,6 +82,7 @@ function Wait-Until {
 
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $lastError = $null
+    $nextProgressSeconds = 60
 
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
@@ -93,6 +94,10 @@ function Wait-Until {
             $lastError = $_.Exception.Message
         }
 
+        if ($stopwatch.Elapsed.TotalSeconds -ge $nextProgressSeconds) {
+            Write-Host "Still waiting for $Description. Last probe: $lastError"
+            $nextProgressSeconds += 60
+        }
         Start-Sleep -Seconds $PollIntervalSeconds
     }
 
@@ -123,12 +128,40 @@ function Wait-VMCommand {
     )
 
     Wait-Until -Description "$Description on '$VMName'" -TimeoutSeconds $TimeoutSeconds -Condition {
-        $result = Invoke-Command -VMName $VMName `
-            -Credential $Credential `
-            -ScriptBlock $ScriptBlock `
-            -ArgumentList $ArgumentList `
-            -ErrorAction Stop
-        @($result) -contains $true
+        $vm = Get-VM -Name $VMName -ErrorAction Stop
+        $heartbeat = Get-VMIntegrationService -VMName $VMName -Name 'Heartbeat' -ErrorAction Stop
+        $state = "State=$($vm.State), Uptime=$($vm.Uptime), Heartbeat=$($heartbeat.PrimaryStatusDescription)"
+        if ($vm.State -ne 'Running' -or -not $heartbeat.Enabled -or $heartbeat.PrimaryOperationalStatus -ne 2) {
+            throw "$VMName is not ready: $state."
+        }
+
+        $job = $null
+        try {
+            $job = Invoke-Command -VMName $VMName `
+                -Credential $Credential `
+                -ScriptBlock $ScriptBlock `
+                -ArgumentList $ArgumentList `
+                -AsJob -ErrorAction Stop
+            if (-not (Wait-Job -Job $job -Timeout 30 -ErrorAction Stop)) {
+                throw 'PowerShell Direct probe exceeded 30 seconds.'
+            }
+            $result = @(Receive-Job -Job $job -ErrorAction Stop)
+            if ($job.State -ne 'Completed' -or $result -notcontains $true) {
+                throw "PowerShell Direct probe did not confirm readiness (job state: $($job.State))."
+            }
+            return $true
+        }
+        catch {
+            throw "$VMName is not ready: $state. $($_.Exception.Message)"
+        }
+        finally {
+            if ($null -ne $job) {
+                if ($job.State -notin @('Completed', 'Failed', 'Stopped')) {
+                    Stop-Job -Job $job -ErrorAction Continue
+                }
+                Remove-Job -Job $job -Force -ErrorAction Continue
+            }
+        }
     }
 }
 
@@ -312,7 +345,7 @@ function Wait-TcpPort {
     }
 }
 
-function Restart-VMAndWait {
+function Restart-WindowsVMAndWait {
     param(
         [Parameter(Mandatory)]
         [string]$VMName,
@@ -321,50 +354,135 @@ function Restart-VMAndWait {
         [pscredential]$Credential
     )
 
-    $previousUptime = (Get-VM -Name $VMName -ErrorAction Stop).Uptime
-    Restart-VM -Name $VMName -Force -ErrorAction Stop
-    Wait-Until `
-        -Description "a completed host-controlled restart of '$VMName'" `
-        -TimeoutSeconds 180 `
-        -PollIntervalSeconds 1 `
-        -Condition {
-            $vm = Get-VM -Name $VMName -ErrorAction Stop
-            $vm.State -eq 'Running' -and $vm.Uptime -lt $previousUptime
+    $job = $null
+    try {
+        Write-Host "Gracefully restarting '$VMName' after its computer rename."
+        $job = Stop-VM -Name $VMName -AsJob -ErrorAction Stop
+        if (-not (Wait-Job -Job $job -Timeout 300 -ErrorAction Stop)) {
+            throw "Graceful shutdown of '$VMName' exceeded 300 seconds; no forced reset will be attempted."
         }
-    Wait-VMCommand `
-        -VMName $VMName `
-        -Credential $Credential `
-        -Description 'PowerShell Direct readiness after host-controlled restart'
-}
-
-function Restart-VMGracefullyAndWaitForHeartbeat {
-    param(
-        [Parameter(Mandatory)]
-        [string]$VMName
-    )
-
-    Stop-VM -Name $VMName -ErrorAction Stop
-    Wait-Until `
-        -Description "a graceful shutdown of '$VMName'" `
-        -TimeoutSeconds 300 `
-        -Condition {
-            (Get-VM -Name $VMName -ErrorAction Stop).State -eq 'Off'
+        Receive-Job -Job $job -ErrorAction Stop | Out-Null
+        $vm = Get-VM -Name $VMName -ErrorAction Stop
+        if ($job.State -ne 'Completed' -or $vm.State -ne 'Off') {
+            throw "Graceful shutdown of '$VMName' did not complete: VM state=$($vm.State), job state=$($job.State)."
         }
+    }
+    finally {
+        if ($null -ne $job) {
+            if ($job.State -notin @('Completed', 'Failed', 'Stopped')) {
+                Stop-Job -Job $job -ErrorAction Continue
+            }
+            Remove-Job -Job $job -Force -ErrorAction Continue
+        }
+    }
 
     Start-VM -Name $VMName -ErrorAction Stop
-    Wait-Until `
-        -Description "a healthy heartbeat after restarting '$VMName'" `
-        -TimeoutSeconds 600 `
-        -Condition {
-            $vm = Get-VM -Name $VMName -ErrorAction Stop
-            $heartbeat = Get-VMIntegrationService `
-                -VMName $VMName `
-                -Name 'Heartbeat' `
-                -ErrorAction Stop
-            $vm.State -eq 'Running' -and
-                $heartbeat.Enabled -and
-                $heartbeat.PrimaryStatusDescription -eq 'OK'
+    Wait-VMCommand -VMName $VMName -Credential $Credential `
+        -Description 'heartbeat, PowerShell Direct and effective computer name after restart' `
+        -ScriptBlock {
+            param($expectedName)
+            if ($env:COMPUTERNAME -ine $expectedName) {
+                throw "Effective computer name is '$env:COMPUTERNAME', expected '$expectedName'."
+            }
+            return $true
+        } -ArgumentList @($VMName)
+}
+
+function Set-WindowsVMComputerName {
+    param(
+        [Parameter(Mandatory)]
+        [string]$VMName,
+
+        [Parameter(Mandatory)]
+        [pscredential]$Credential
+    )
+
+    Wait-VMCommand -VMName $VMName -Credential $Credential
+    $restartRequired = Invoke-VMCommandWithRetry -VMName $VMName -Credential $Credential `
+        -Description 'state-aware computer rename' -ArgumentList @($VMName) -ScriptBlock {
+            param($newName)
+            $ErrorActionPreference = 'Stop'
+            $nameRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName'
+            $activeName = (Get-ItemProperty -LiteralPath "$nameRoot\ActiveComputerName" -ErrorAction Stop).ComputerName
+            $pendingName = (Get-ItemProperty -LiteralPath "$nameRoot\ComputerName" -ErrorAction Stop).ComputerName
+            if ($activeName -ieq $newName) {
+                if ($pendingName -ine $newName) {
+                    throw "Computer '$activeName' has a conflicting pending rename to '$pendingName'."
+                }
+                return $false
+            }
+            # A previous attempt may have renamed the guest but lost its reply before reboot.
+            if ($pendingName -ine $newName) {
+                Rename-Computer -NewName $newName -ErrorAction Stop | Out-Null
+            }
+            return $true
         }
+    if ($restartRequired.Count -ne 1 -or $restartRequired[0] -isnot [bool]) {
+        throw "Computer rename on '$VMName' did not return one Boolean restart decision."
+    }
+    if ($restartRequired[0]) {
+        Restart-WindowsVMAndWait -VMName $VMName -Credential $Credential
+    }
+}
+
+function Invoke-LabVMConfiguration {
+    param(
+        [Parameter(Mandatory)]
+        [string]$FilePath
+    )
+
+    $wingetPath = (Get-Command winget -CommandType Application -ErrorAction Stop).Source
+    # The pinned, packaged WinGet CLI writes its diagnostics in this per-user directory.
+    $diagnosticDirectory = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir'
+    $runId = [guid]::NewGuid().ToString('N')
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $previousLogs = @(
+            if (Test-Path -LiteralPath $diagnosticDirectory) {
+                Get-ChildItem -LiteralPath $diagnosticDirectory -Filter '*.log' -File -ErrorAction Stop |
+                    Select-Object -ExpandProperty FullName
+            }
+        )
+        Write-Host "Configuring '$FilePath' with WinGet (attempt $attempt/3; verbose logs: $diagnosticDirectory)."
+        $process = Start-Process -FilePath $wingetPath -ArgumentList @(
+            'configure', '--file', "`"$FilePath`"", '--accept-configuration-agreements',
+            '--disable-interactivity', '--verbose-logs'
+        ) -NoNewWindow -Wait -PassThru -ErrorAction Stop
+        if ($process.ExitCode -eq 0) { return }
+
+        $failure = "WinGet configuration '$FilePath' failed with exit code $($process.ExitCode)."
+        $logs = @()
+        try {
+            if (Test-Path -LiteralPath $diagnosticDirectory) {
+                $logs = @(Get-ChildItem -LiteralPath $diagnosticDirectory -Filter '*.log' -File -ErrorAction Stop |
+                    Where-Object { $_.FullName -notin $previousLogs } |
+                    ForEach-Object {
+                        $content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction Stop
+                        if ($content -match "Process:\s*winget\.exe\[$($process.Id)\]") {
+                            [pscustomobject]@{ Path = $_.FullName; Content = $content }
+                        }
+                    })
+            }
+            if ($logs.Count -eq 1) {
+                $savedLog = Join-Path $env:MHBoxLogsDir "WinGet-$runId-attempt-$attempt.log"
+                Copy-Item -LiteralPath $logs[0].Path -Destination $savedLog -ErrorAction Stop
+                Write-Host "WinGet diagnostic log saved to '$savedLog'."
+            }
+        }
+        catch {
+            throw "$failure Could not preserve diagnostic logs: $($_.Exception.Message)"
+        }
+
+        # E_FAIL alone is not safe to retry: require this process's exact pre-execution factory failure.
+        $startupFailure = $logs.Count -eq 1 -and $process.ExitCode -eq -2147467259 -and
+            $logs[0].Content -match 'ConfigurationSetProcessorFactoryRemoting\.cpp\(110\).*80004005' -and
+            $logs[0].Content -notmatch '(?im)\[(?:CONFIG|CONF)\].*\b(?:unit|Applying|ApplySet|ApplyConfigurationSet|state|progress)\b'
+        if (-not $startupFailure -or $attempt -eq 3) {
+            throw "$failure No further automatic retry; inspect the verbose WinGet diagnostics."
+        }
+        $delay = 30 * $attempt
+        Write-Warning "$failure Configuration worker initialization failed before unit execution; retrying in $delay seconds."
+        Start-Sleep -Seconds $delay
+    }
 }
 
 function Test-TcpPort {
@@ -793,37 +911,8 @@ if ($Env:flavor -eq 'ITPro') {
     # Create the nested SQL VMs
     $sqlDscConfigurationFile = "$Env:MHBoxDscDir\virtual_machines_sql.dsc.yml"
     (Get-Content -Path $sqlDscConfigurationFile) -replace 'namingPrefixStage', $namingPrefix | Set-Content -Path $sqlDscConfigurationFile
-    winget configure --file C:\MHBox\DSC\virtual_machines_sql.dsc.yml --accept-configuration-agreements --disable-interactivity
-    if ($LASTEXITCODE -ne 0) { throw "SQL VM WinGet configuration failed with exit code $LASTEXITCODE." }
-
-    # Restart the newly created VM from the host before guest configuration.
-    Write-Host 'Restarting the nested SQL VM'
-    Restart-VMAndWait -VMName $SQLvmName -Credential $winCreds
-
-    # Rename server if hostname is not as MHBox-SQL or doesn't match naming prefix
-    $hostname = Invoke-VMCommandWithRetry `
-        -VMName $SQLvmName `
-        -Credential $winCreds `
-        -ScriptBlock { hostname } `
-        -Description 'hostname query'
-
-    if ($hostname -ne $SQLvmName) {
-
-        Write-Host "`n### Renaming the nested SQL VM ###`n"
-        Invoke-VMCommandWithRetry `
-            -VMName $SQLvmName `
-            -Credential $winCreds `
-            -ScriptBlock {
-                param($newName)
-                $ErrorActionPreference = 'Stop'
-                if ($env:COMPUTERNAME -cne $newName) {
-                    Rename-Computer -NewName $newName
-                }
-            } `
-            -ArgumentList $SQLvmName `
-            -Description 'computer rename'
-        Restart-VMAndWait -VMName $SQLvmName -Credential $winCreds
-    }
+    Invoke-LabVMConfiguration -FilePath $sqlDscConfigurationFile
+    Set-WindowsVMComputerName -VMName $SQLvmName -Credential $winCreds
 
     # Enable Windows Firewall rule for SQL Server
     Invoke-VMCommandWithRetry `
@@ -904,15 +993,20 @@ if ($Env:flavor -eq 'ITPro') {
         Write-Host "`n### Create Hyper-V VMs ###`n"
         $serversDscConfigurationFile = "$Env:MHBoxDscDir\virtual_machines_itpro.dsc.yml"
         (Get-Content -Path $serversDscConfigurationFile) -replace 'namingPrefixStage', $namingPrefix | Set-Content -Path $serversDscConfigurationFile
-        winget configure --file C:\MHBox\DSC\virtual_machines_itpro.dsc.yml --accept-configuration-agreements --disable-interactivity
-        if ($LASTEXITCODE -ne 0) { throw "Nested VM WinGet configuration failed with exit code $LASTEXITCODE." }
+        Invoke-LabVMConfiguration -FilePath $serversDscConfigurationFile
 
         # Configure automatic start & stop action for the nested VMs
         foreach ($vmName in $expectedVmNames) {
-            $vm = Get-VM -Name $vmName
-            if ($vm.State -eq 'Running') { Stop-VM -Force -Name $vmName }
-            Set-VM -Name $vmName -AutomaticStopAction ShutDown -AutomaticStartAction Start
-            Start-VM -Name $vmName
+            Set-VM -Name $vmName -AutomaticStopAction ShutDown -AutomaticStartAction Start -ErrorAction Stop
+            Wait-Until -Description "a stable power state on '$vmName'" -TimeoutSeconds 300 -Condition {
+                $vm = Get-VM -Name $vmName -ErrorAction Stop
+                switch ([string]$vm.State) {
+                    'Off' { Start-VM -Name $vmName -ErrorAction Stop; return $true }
+                    'Running' { return $true }
+                    { $_ -in @('Starting', 'Stopping') } { throw "VM '$vmName' is still $($vm.State)." }
+                    default { throw "VM '$vmName' is in unsupported state '$($vm.State)'; manual inspection is required." }
+                }
+            }
         }
 
         foreach ($vmName in @($SQLvmName, $Win2k22vmName, $AzMigSrvvmName)) {
@@ -928,24 +1022,7 @@ if ($Env:flavor -eq 'ITPro') {
             # Renaming the nested VMs
             Write-Host "`n### Renaming the nested Windows VMs ###`n"
             foreach ($vmName in @($Win2k22vmName, $AzMigSrvvmName)) {
-                $restartRequired = Invoke-VMCommandWithRetry `
-                    -VMName $vmName `
-                    -Credential $winCreds `
-                    -ScriptBlock {
-                        param($newName)
-                        $ErrorActionPreference = 'Stop'
-                        if ($env:COMPUTERNAME -ceq $newName) {
-                            return $false
-                        }
-                        Rename-Computer -NewName $newName
-                        return $true
-                    } `
-                    -ArgumentList $vmName `
-                    -Description 'computer rename'
-
-                if ($restartRequired) {
-                    Restart-VMGracefullyAndWaitForHeartbeat -VMName $vmName
-                }
+                Set-WindowsVMComputerName -VMName $vmName -Credential $winCreds
             }
         }
 
@@ -1180,7 +1257,7 @@ if ($Env:flavor -eq 'ITPro') {
                         -UserName $nestedLinuxUsername `
                         -KeyFilePath $linuxKeyFilePath `
                         -PreviousBootId $previousBootId `
-                        -TimeoutSeconds 300
+                        -TimeoutSeconds 600
                 }
                 catch {
                     throw "Ubuntu reboot was not acknowledged and no new boot was observed. Configuration error: $($configurationError.Exception.Message) Reboot error: $($_.Exception.Message)"

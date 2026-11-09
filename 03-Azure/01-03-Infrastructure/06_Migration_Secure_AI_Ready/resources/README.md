@@ -130,6 +130,10 @@ An incomplete deployment retry must retain its RG, names, region, source version
 
 **ARM success alone is not lab readiness.** The host reboots after Bootstrap, then logon provisioning prepares the nested guests. Inspect `C:\MHBox\Logs` if setup fails.
 
+Guest provisioning avoids unnecessary VM restarts. Windows computer renames use graceful shutdown and verify heartbeat, PowerShell Direct, and the effective computer name after startup. Confirmed WinGet configuration-worker initialization failures are retried at most twice, with separate verbose diagnostic logs; other configuration failures stop provisioning.
+
+Console reruns preserve completed, verified baselines, but do not automatically restart a failed guest-provisioning task or refresh scripts already downloaded by a successful Bootstrap extension. For an incomplete host, preserve its logs and disks, ensure the previous task has stopped, and have the instructor refresh `C:\MHBox\MHServersLogonScript.ps1` from the matching deployment source before starting its retained `MHServersLogonScript` task under the logged-in host administrator. Then rerun Console verification. Never run this task on a completed learner lab or clear readiness tags to force a retry.
+
 For either option, complete [Solution 1's initial-handoff checks](../walkthrough/challenge-01/solution-01.md): host tags `DeploymentProgress=Deployment Completed` and `LabReady=single-rg-v1`, a valid schema-version-1 `C:\MHBox\lab-ready.json`, all four nested VMs running, and both live dashboards returning HTTP success with correct metadata. Console labs additionally have RG tag `LabVerified=single-rg-v1`; manual instructors perform the verification themselves, without that Console tag.
 
 For manual labs, securely provide the subscription, RG, region, host, Key Vault, network names, and login instructions to learners. References to the "dashboard" in later challenges mean these instructor-provided details when no Console is used.
