@@ -623,7 +623,7 @@ if ($flavor -eq 'ITPro') {
 # Clean up Bootstrap.log
 Write-Host 'Clean up Bootstrap.log'
 Stop-Transcript
-$logSuppress = Get-Content "$Env:MHBoxLogsDir\Bootstrap.log" | Where-Object { $_ -notmatch "Host Application: $ScheduledTaskExecutable" }
+$logSuppress = Get-Content "$Env:MHBoxLogsDir\Bootstrap.log" | Where-Object { $_ -notmatch [regex]::Escape("Host Application: $ScheduledTaskExecutable") }
 $logSuppress | Set-Content "$Env:MHBoxLogsDir\Bootstrap.log" -Force
 
 # Let CSE report success before the host reboots and starts the logon stage.
