@@ -1290,12 +1290,27 @@ if ($Env:flavor -eq 'ITPro') {
 
         $activationScript = {
             $ErrorActionPreference = 'Stop'
+            $kmsServer = 'azkms.core.windows.net'
+            Write-Host "Activating Windows on '$env:COMPUTERNAME' using ${kmsServer}:1688."
+            if (-not (Test-NetConnection -ComputerName $kmsServer -Port 1688 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+                throw "Windows activation on '$env:COMPUTERNAME' cannot reach ${kmsServer}:1688. Check guest DNS, outbound TCP 1688 and the host NAT path."
+            }
             cscript C:\Windows\system32\slmgr.vbs -ipk VDYBN-27WPP-V4HQT-9VMD4-VMK7H
             if ($LASTEXITCODE -ne 0) { throw "Windows product key installation failed with exit code $LASTEXITCODE." }
-            cscript C:\Windows\system32\slmgr.vbs -skms kms.core.windows.net
+            cscript C:\Windows\system32\slmgr.vbs -skms "${kmsServer}:1688"
             if ($LASTEXITCODE -ne 0) { throw "Windows KMS configuration failed with exit code $LASTEXITCODE." }
-            cscript C:\Windows\system32\slmgr.vbs -ato
-            if ($LASTEXITCODE -ne 0) { throw "Windows activation failed with exit code $LASTEXITCODE." }
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                $activationOutput = @(cscript C:\Windows\system32\slmgr.vbs -ato)
+                $activationExitCode = $LASTEXITCODE
+                $activationOutput | Write-Output
+                if ($activationExitCode -eq 0) { break }
+                $activationCode = '0x{0:X8}' -f ($activationExitCode -band 0xffffffffL)
+                $failure = "Windows activation on '$env:COMPUTERNAME' failed with $activationCode (exit code $activationExitCode; KMS ${kmsServer}:1688). $($activationOutput -join ' ')"
+                if ($activationExitCode -ne -1073418124 -or $attempt -eq 3) { throw $failure }
+                $delay = 30 * $attempt
+                Write-Warning "$failure Retrying KMS activation in $delay seconds (attempt $attempt/3)."
+                Start-Sleep -Seconds $delay
+            }
             cscript C:\Windows\system32\slmgr.vbs -dlv
             if ($LASTEXITCODE -ne 0) { throw "Windows activation query failed with exit code $LASTEXITCODE." }
         }
