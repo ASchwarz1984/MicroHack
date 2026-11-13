@@ -377,18 +377,15 @@ function Wait-TcpPort {
     }
 }
 
-function Restart-WindowsVMAndWait {
+function Stop-VMGracefullyAndWait {
     param(
         [Parameter(Mandatory)]
-        [string]$VMName,
-
-        [Parameter(Mandatory)]
-        [pscredential]$Credential
+        [string]$VMName
     )
 
     $job = $null
     try {
-        Write-Host "Gracefully restarting '$VMName' after its computer rename."
+        Write-Host "Gracefully shutting down '$VMName'."
         $job = Stop-VM -Name $VMName -AsJob -ErrorAction Stop
         if (-not (Wait-Job -Job $job -Timeout 300 -ErrorAction Stop)) {
             throw "Graceful shutdown of '$VMName' exceeded 300 seconds; no forced reset will be attempted."
@@ -407,7 +404,19 @@ function Restart-WindowsVMAndWait {
             Remove-Job -Job $job -Force -ErrorAction Continue
         }
     }
+}
 
+function Restart-WindowsVMAndWait {
+    param(
+        [Parameter(Mandatory)]
+        [string]$VMName,
+
+        [Parameter(Mandatory)]
+        [pscredential]$Credential
+    )
+
+    Write-Host "Gracefully restarting '$VMName' after its computer rename."
+    Stop-VMGracefullyAndWait -VMName $VMName
     Start-VM -Name $VMName -ErrorAction Stop
     Wait-VMCommand -VMName $VMName -Credential $Credential `
         -Description 'heartbeat, PowerShell Direct and effective computer name after restart' `
@@ -969,16 +978,29 @@ if ($Env:flavor -eq 'ITPro') {
 
         # Configure automatic start & stop action for the nested VMs
         foreach ($vmName in $expectedVmNames) {
-            Set-VM -Name $vmName -AutomaticStopAction ShutDown -AutomaticStartAction Start -ErrorAction Stop
             Wait-Until -Description "a stable power state on '$vmName'" -TimeoutSeconds 300 -Condition {
                 $vm = Get-VM -Name $vmName -ErrorAction Stop
                 switch ([string]$vm.State) {
-                    'Off' { Start-VM -Name $vmName -ErrorAction Stop; return $true }
+                    'Off' { return $true }
                     'Running' { return $true }
                     { $_ -in @('Starting', 'Stopping') } { throw "VM '$vmName' is still $($vm.State)." }
                     default { throw "VM '$vmName' is in unsupported state '$($vm.State)'; manual inspection is required." }
                 }
             }
+            $vm = Get-VM -Name $vmName -ErrorAction Stop
+            if ($vm.State -notin @('Off', 'Running')) {
+                throw "VM '$vmName' changed to unsupported state '$($vm.State)' before power policy configuration."
+            }
+            if ($vm.AutomaticStopAction -ne 'ShutDown' -or $vm.AutomaticStartAction -ne 'Start') {
+                Write-Host "Configuring automatic power actions on '$vmName' while off (current: $($vm.AutomaticStopAction)/$($vm.AutomaticStartAction))."
+                if ($vm.State -eq 'Running') { Stop-VMGracefullyAndWait -VMName $vmName }
+                Set-VM -Name $vmName -AutomaticStopAction ShutDown -AutomaticStartAction Start -ErrorAction Stop
+                $vm = Get-VM -Name $vmName -ErrorAction Stop
+                if ($vm.State -ne 'Off' -or $vm.AutomaticStopAction -ne 'ShutDown' -or $vm.AutomaticStartAction -ne 'Start') {
+                    throw "Automatic power actions on '$vmName' were not applied while off; inspect its Hyper-V configuration."
+                }
+            }
+            if ($vm.State -eq 'Off') { Start-VM -Name $vmName -ErrorAction Stop }
         }
 
         Write-Host "`n### Creating VM Credentials ###`n"
