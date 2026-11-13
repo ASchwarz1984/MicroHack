@@ -4,5 +4,23 @@
   "deploymentType": "resourcegroup-with-subscriptionowner",
   "labsPerSubscription": 5,
   "preferredLocation": "swedencentral",
-  "estimatedDailyCostsUsd": 80.0
+  "estimatedDailyCostsUsd": 80.0,
+  "contentPreparation": {
+    "variants": [],
+    "alwaysRemove": {},
+    "variantRemovals": {},
+    "variantRenames": {},
+    "studentZipExclusions": [],
+    "coachZipExclusions": [],
+    "banners": {
+      "challenges": {
+        "download": false,
+        "parentReadme": false
+      },
+      "solutions": {
+        "download": false,
+        "parentReadme": false
+      }
+    }
+  }
 }
