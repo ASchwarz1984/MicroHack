@@ -6,6 +6,9 @@ properties:
       id: VMHost
       directives:
         description: Configure VM Host settings
+        module: HyperVDsc
+        version: 4.0.0-preview0006
+        allowPrerelease: true
       settings:
         IsSingleInstance: Yes
         EnableEnhancedSessionMode: True
@@ -13,6 +16,9 @@ properties:
       id: VMSwitch
       directives:
         description: Configure VM Switch
+        module: HyperVDsc
+        version: 4.0.0-preview0006
+        allowPrerelease: true
       settings:
         Name: InternalNATSwitch
         Ensure: Present
@@ -21,6 +27,8 @@ properties:
       id: IPAddress.VMSwitch
       directives:
         description: Configure VM Switch vNIC IP Address
+        module: NetworkingDsc
+        version: 9.1.0
       settings:
         InterfaceAlias: 'vEthernet (InternalNATSwitch)'
         IPAddress: '10.10.1.1/24'

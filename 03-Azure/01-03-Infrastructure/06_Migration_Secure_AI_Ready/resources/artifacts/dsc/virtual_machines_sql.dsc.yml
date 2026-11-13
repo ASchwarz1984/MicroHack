@@ -5,6 +5,9 @@ properties:
       id: namingPrefixStage-SQL
       directives:
         description: Configure VM namingPrefixStage-SQL
+        module: HyperVDsc
+        version: 4.0.0-preview0006
+        allowPrerelease: true
       settings:
         Name: namingPrefixStage-SQL
         SwitchName: 'InternalNATSwitch'

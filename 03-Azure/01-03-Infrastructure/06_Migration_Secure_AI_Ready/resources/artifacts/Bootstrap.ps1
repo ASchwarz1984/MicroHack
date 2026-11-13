@@ -26,11 +26,65 @@ param (
 )
 
 $ErrorActionPreference = 'Stop'
+$provisioningStarted = $false
+$provisioningLock = $null
+
+function Save-LabDownload {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$Destination,
+        [int]$TimeoutSeconds = 120,
+        [string]$Sha256
+    )
+    $temporaryPath = "$Destination.$([guid]::NewGuid().ToString('N')).download"
+    try {
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $temporaryPath -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+                break
+            }
+            catch {
+                $transient = $false
+                for ($exception = $_.Exception; $null -ne $exception; $exception = $exception.InnerException) {
+                    $status = [string]$exception.Response.StatusCode
+                    if (-not $status) { $status = [string]$exception.StatusCode }
+                    if ($status) {
+                        $transient = $status -match '^(408|429|500|502|503|504|RequestTimeout|TooManyRequests|InternalServerError|BadGateway|ServiceUnavailable|GatewayTimeout)$'
+                        break
+                    }
+                    if ($exception -is [Net.WebException] -and
+                        $exception.Status -in @('Timeout', 'ConnectFailure', 'ConnectionClosed', 'ReceiveFailure', 'SendFailure', 'NameResolutionFailure', 'KeepAliveFailure')) {
+                        $transient = $true
+                    }
+                }
+                if (-not $transient -or $attempt -eq 3) { throw }
+                Write-Warning "Download attempt $attempt/3 failed for '$Uri': $($_.Exception.Message)"
+                Start-Sleep -Seconds (10 * $attempt)
+            }
+        }
+        if ((Get-Item -LiteralPath $temporaryPath -ErrorAction Stop).Length -eq 0) { throw "Downloaded file is empty: $Uri" }
+        if ($Sha256 -and (Get-FileHash -LiteralPath $temporaryPath -Algorithm SHA256).Hash -ine $Sha256) {
+            throw "Downloaded file failed SHA256 validation: $Uri"
+        }
+        if ([IO.Path]::GetExtension($Destination) -eq '.ps1') {
+            $tokens = $null
+            $parseErrors = $null
+            [Management.Automation.Language.Parser]::ParseFile($temporaryPath, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count) { throw "Downloaded PowerShell script is invalid: $Uri. $($parseErrors -join '; ')" }
+        }
+        Move-Item -LiteralPath $temporaryPath -Destination $Destination -Force -ErrorAction Stop
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction Continue
+        }
+    }
+}
 
 trap {
     $failure = $_
     Write-Error -ErrorRecord $failure -ErrorAction Continue
-    Remove-Item -LiteralPath 'C:\MHBox\lab-ready.json' -Force -ErrorAction SilentlyContinue
+    if (-not $provisioningStarted) { exit 1 }
     $azFailureScriptPath = $null
     try {
         # Keep Az isolated from the parent's package-management assemblies.
@@ -69,6 +123,14 @@ foreach ($target in @($groupId, "$groupId/providers/Microsoft.Compute/virtualMac
     }
     exit 1
 }
+
+try {
+New-Item -Path 'C:\MHBox' -ItemType Directory -Force | Out-Null
+$provisioningLock = [IO.File]::Open('C:\MHBox\provisioning.lock', 'OpenOrCreate', 'ReadWrite', 'None')
+if (Test-Path -LiteralPath 'C:\MHBox\lab-ready.json') {
+    throw 'A lab readiness marker exists. Bootstrap will not modify this baseline; use guest completion recovery if handoff needs repair.'
+}
+$provisioningStarted = $true
 
 [System.Environment]::SetEnvironmentVariable('adminUsername', $adminUsername, [System.EnvironmentVariableTarget]::Machine)
 [System.Environment]::SetEnvironmentVariable('spnAuthority', $spnAuthority, [System.EnvironmentVariableTarget]::Machine)
@@ -141,10 +203,7 @@ New-Item -Path $Env:MHBoxLogsDir -ItemType Directory -Force | Out-Null
 New-Item -Path $Env:tempDir -ItemType Directory -Force | Out-Null
 New-Item -Path $Env:MHBoxDemoPageDir -ItemType Directory -Force | Out-Null
 
-Start-Transcript -Path "$Env:MHBoxLogsDir\Bootstrap.log"
-if (Test-Path -LiteralPath "$Env:MHBoxDir\lab-ready.json") {
-    Remove-Item -LiteralPath "$Env:MHBoxDir\lab-ready.json" -Force
-}
+Start-Transcript -Path "$Env:MHBoxLogsDir\Bootstrap.log" -Append
 Initialize-LabDataDisk
 New-Item -Path $Env:MHBoxVMDir -ItemType Directory -Force | Out-Null
 
@@ -169,11 +228,43 @@ if ((Get-Partition -DriveLetter C).Size -lt $maximumSystemPartitionSize) {
     Resize-Partition -DriveLetter C -Size $maximumSystemPartitionSize
 }
 
-# Installing PowerShell Modules
-Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
+# Fetch the existing artifacts before installing modules so both stages can reuse WinGet's helpers.
+Write-Host "`n### Fetching GitHub Artifacts ###`n"
+$artifacts = [ordered]@{
+    'artifacts/dsc/common.dsc.yml' = "$Env:MHBoxDscDir\common.dsc.yml"
+    'artifacts/dsc/virtual_machines_sql.dsc.yml' = "$Env:MHBoxDscDir\virtual_machines_sql.dsc.yml"
+    'artifacts/WinGet.ps1' = "$Env:MHBoxDir\WinGet.ps1"
+    'artifacts/demopage/deploy-webapp.sh' = "$Env:MHBoxDemoPageDir\deploy-webapp.sh"
+    'artifacts/demopage/deployWebApp.ps1' = "$Env:MHBoxDemoPageDir\deployWebApp.ps1"
+}
+if ($flavor -eq 'ITPro') {
+    $artifacts['artifacts/MHServersLogonScript.ps1'] = "$Env:MHBoxDir\MHServersLogonScript.ps1"
+    $artifacts['artifacts/dsc/itpro.dsc.yml'] = "$Env:MHBoxDscDir\itpro.dsc.yml"
+    $artifacts['artifacts/dsc/virtual_machines_itpro.dsc.yml'] = "$Env:MHBoxDscDir\virtual_machines_itpro.dsc.yml"
+}
+foreach ($artifact in $artifacts.GetEnumerator()) {
+    Save-LabDownload -Uri ($templateBaseUrl + $artifact.Key) -Destination $artifact.Value
+}
+. "$Env:MHBoxDir\WinGet.ps1" -FunctionsOnly
 
-Install-Module -Name Microsoft.PowerShell.PSResourceGet -Force
-Install-PSResource -Name Az -Scope AllUsers -Quiet -AcceptLicense -TrustRepository
+# Install only the PowerShell dependencies used by provisioning and the documented learner commands.
+if (-not (Get-PackageProvider -ListAvailable | Where-Object { $_.Name -eq 'NuGet' -and $_.Version -ge [version]'2.8.5.201' })) {
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+}
+if (-not (Get-Module -ListAvailable -Name Microsoft.PowerShell.PSResourceGet | Where-Object {
+    $_.Version -eq [version]'1.3.1' -and [string]$_.PrivateData.PSData.Prerelease -ceq ''
+})) {
+    Install-Module -Name Microsoft.PowerShell.PSResourceGet -RequiredVersion 1.3.1 -Scope AllUsers -Force
+}
+Import-Module -Name Microsoft.PowerShell.PSResourceGet -RequiredVersion 1.3.1 -Force
+foreach ($module in ([ordered]@{
+    'Az.Accounts' = '5.5.4'
+    'Az.Resources' = '10.2.2'
+    'Az.KeyVault' = '6.6.2'
+    'Az.Compute' = '11.11.0'
+}).GetEnumerator()) {
+    Install-LabPSResource -Name $module.Key -Version $module.Value
+}
 
 # Azure init in isolated child process
 $azInitScriptPath = "$Env:tempDir\AzBootstrap-Init.ps1"
@@ -311,34 +402,24 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "`n### Installing PowerShell 7 ###`n"
 
 $ProgressPreference = 'SilentlyContinue'
-$url = 'https://github.com/PowerShell/PowerShell/releases/latest'
-$latestVersion = (Invoke-WebRequest -UseBasicParsing -Uri $url).Content |
-    Select-String -Pattern 'v[0-9]+\.[0-9]+\.[0-9]+' |
-    Select-Object -ExpandProperty Matches |
-    Select-Object -ExpandProperty Value
-
-$downloadUrl = "https://github.com/PowerShell/PowerShell/releases/download/$latestVersion/PowerShell-$($latestVersion.Substring(1,5))-win-x64.msi"
-Invoke-WebRequest -UseBasicParsing -Uri $downloadUrl -OutFile .\PowerShell7.msi
-$installation = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/I PowerShell7.msi /quiet ADD_EXPLORER_CONTEXT_MENU_OPENPOWERSHELL=1 ADD_FILE_CONTEXT_MENU_RUNPOWERSHELL=1 ENABLE_PSREMOTING=1 REGISTER_MANIFEST=1 USE_MU=1 ENABLE_MU=1 ADD_PATH=1'
-if ($installation.ExitCode -notin @(0, 3010)) { throw "PowerShell installation failed with exit code $($installation.ExitCode)." }
-Remove-Item .\PowerShell7.msi -Force
-
-Write-Host "`n### Fetching GitHub Artifacts ###`n"
-
-# All flavors
-Write-Host 'Fetching Artifacts for All Flavors'
-Invoke-WebRequest ($templateBaseUrl + 'artifacts/dsc/common.dsc.yml') -OutFile "$Env:MHBoxDscDir\common.dsc.yml"
-Invoke-WebRequest ($templateBaseUrl + 'artifacts/dsc/virtual_machines_sql.dsc.yml') -OutFile "$Env:MHBoxDscDir\virtual_machines_sql.dsc.yml"
-Invoke-WebRequest ($templateBaseUrl + 'artifacts/WinGet.ps1') -OutFile "$Env:MHBoxDir\WinGet.ps1"
-Invoke-WebRequest ($templateBaseUrl + 'artifacts/demopage/deploy-webapp.sh') -OutFile "$Env:MHBoxDemoPageDir\deploy-webapp.sh"
-Invoke-WebRequest ($templateBaseUrl + 'artifacts/demopage/deployWebApp.ps1') -OutFile "$Env:MHBoxDemoPageDir\deployWebApp.ps1"
-
-# ITPro
-if ($flavor -eq 'ITPro') {
-    Write-Host 'Fetching Artifacts for ITPro Flavor'
-    Invoke-WebRequest ($templateBaseUrl + 'artifacts/MHServersLogonScript.ps1') -OutFile "$Env:MHBoxDir\MHServersLogonScript.ps1"
-    Invoke-WebRequest ($templateBaseUrl + 'artifacts/dsc/itpro.dsc.yml') -OutFile "$Env:MHBoxDscDir\itpro.dsc.yml"
-    Invoke-WebRequest ($templateBaseUrl + 'artifacts/dsc/virtual_machines_itpro.dsc.yml') -OutFile "$Env:MHBoxDscDir\virtual_machines_itpro.dsc.yml"
+$powerShellVersion = '7.6.9'
+$ScheduledTaskExecutable = "$env:ProgramFiles\PowerShell\7\pwsh.exe"
+$installedVersion = if (Test-Path -LiteralPath $ScheduledTaskExecutable) {
+    & $ScheduledTaskExecutable -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
+    if ($LASTEXITCODE -ne 0) { throw 'The installed PowerShell executable failed its version check.' }
+}
+if ($installedVersion -ne $powerShellVersion) {
+    $msiPath = "$Env:tempDir\PowerShell-$powerShellVersion-win-x64.msi"
+    Save-LabDownload -Uri "https://github.com/PowerShell/PowerShell/releases/download/v$powerShellVersion/PowerShell-$powerShellVersion-win-x64.msi" `
+        -Destination $msiPath -TimeoutSeconds 300 `
+        -Sha256 '50d33c7494aaf82b987cfd4de3f232d04f91fdd4c0deeca8a669cced3e7cf8f9'
+    $installation = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/I `"$msiPath`" /quiet /norestart ADD_EXPLORER_CONTEXT_MENU_OPENPOWERSHELL=1 ADD_FILE_CONTEXT_MENU_RUNPOWERSHELL=1 ENABLE_PSREMOTING=1 REGISTER_MANIFEST=1 USE_MU=1 ENABLE_MU=1 ADD_PATH=1"
+    if ($installation.ExitCode -notin @(0, 3010)) { throw "PowerShell installation failed with exit code $($installation.ExitCode)." }
+    Remove-Item -LiteralPath $msiPath -Force
+}
+$actualVersion = & $ScheduledTaskExecutable -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
+if ($LASTEXITCODE -ne 0 -or $actualVersion -ne $powerShellVersion) {
+    throw "Expected PowerShell $powerShellVersion; found '$actualVersion' (exit code $LASTEXITCODE)."
 }
 
 # Disable Microsoft Edge sidebar
@@ -440,8 +521,6 @@ Write-Host "Registry setting applied successfully. fClientDisableUDP set to $reg
 
 Write-Host "`n### Configuring Logon Scripts ###`n"
 
-$ScheduledTaskExecutable = 'pwsh.exe'
-
 # Progress tag update in isolated child process
 $DeploymentProgressString = 'Restarting and installing WinGet packages...'
 
@@ -515,14 +594,15 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if ($flavor -eq 'ITPro') {
+    $taskSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
     # Creating scheduled task for WinGet.ps1
     $Trigger = New-ScheduledTaskTrigger -AtLogOn
-    $Action = New-ScheduledTaskAction -Execute $ScheduledTaskExecutable -Argument "-NoProfile -File $Env:MHBoxDir\WinGet.ps1"
-    Register-ScheduledTask -TaskName 'WinGetLogonScript' -Trigger $Trigger -User $adminUsername -Action $Action -RunLevel Highest -Force | Out-Null
+    $Action = New-ScheduledTaskAction -Execute $ScheduledTaskExecutable -Argument "-NoProfile -NonInteractive -File $Env:MHBoxDir\WinGet.ps1"
+    Register-ScheduledTask -TaskName 'WinGetLogonScript' -Trigger $Trigger -User $adminUsername -Action $Action -Settings $taskSettings -RunLevel Highest -Force | Out-Null
 
     # Creating scheduled task for MHServersLogonScript.ps1
-    $Action = New-ScheduledTaskAction -Execute $ScheduledTaskExecutable -Argument $Env:MHBoxDir\MHServersLogonScript.ps1
-    Register-ScheduledTask -TaskName 'MHServersLogonScript' -User $adminUsername -Action $Action -RunLevel Highest -Force | Out-Null
+    $Action = New-ScheduledTaskAction -Execute $ScheduledTaskExecutable -Argument "-NoProfile -NonInteractive -File $Env:MHBoxDir\MHServersLogonScript.ps1"
+    Register-ScheduledTask -TaskName 'MHServersLogonScript' -User $adminUsername -Action $Action -Settings $taskSettings -RunLevel Highest -Force | Out-Null
 }
 
 # Disabling Windows Server Manager Scheduled Task
@@ -555,3 +635,7 @@ Register-ScheduledTask -TaskName 'MHBox-BootstrapRestart' -Action $restartAction
     -Principal $restartPrincipal -Force | Out-Null
 Write-Host 'Bootstrap completed; the host restart is scheduled in two minutes.'
 exit 0
+}
+finally {
+    if ($null -ne $provisioningLock) { $provisioningLock.Dispose() }
+}

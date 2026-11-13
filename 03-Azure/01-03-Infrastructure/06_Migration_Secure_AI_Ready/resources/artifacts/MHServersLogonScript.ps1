@@ -1,9 +1,11 @@
 $ErrorActionPreference = 'Stop'
+$provisioningStarted = $false
+$provisioningLock = $null
 
 trap {
     $failure = $_
     Write-Error -ErrorRecord $failure -ErrorAction Continue
-    Remove-Item -LiteralPath 'C:\MHBox\lab-ready.json' -Force -ErrorAction SilentlyContinue
+    if (-not $provisioningStarted) { exit 1 }
     try {
         Connect-AzAccount -Identity -Tenant $env:tenantId -Subscription $env:subscriptionId -ErrorAction Stop | Out-Null
         $groupId = "/subscriptions/$env:subscriptionId/resourceGroups/$env:resourceGroup"
@@ -17,6 +19,37 @@ trap {
     catch { Write-Warning "Could not authenticate to report guest provisioning failure: $($_.Exception.Message)" }
     exit 1
 }
+
+function Set-LabDeploymentTags {
+    param([hashtable]$Tags)
+    $groupId = "/subscriptions/$env:subscriptionId/resourceGroups/$env:resourceGroup"
+    foreach ($target in @($groupId, "$groupId/providers/Microsoft.Compute/virtualMachines/$env:hostVmName")) {
+        Update-AzTag -ResourceId $target -Operation Merge -Tag $Tags | Out-Null
+    }
+}
+
+function Complete-LabProvisioning {
+    Set-LabDeploymentTags @{ DeploymentProgress = 'Deployment Completed'; LabReady = 'single-rg-v1' }
+    try {
+        Get-ScheduledTask -TaskPath '\' -ErrorAction Stop |
+            Where-Object TaskName -In @('MHServersLogonScript', 'WinGetLogonScript') |
+            Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop
+    }
+    catch { Write-Warning "The baseline is ready, but provisioning task cleanup failed: $($_.Exception.Message)" }
+}
+
+try {
+New-Item -Path 'C:\MHBox' -ItemType Directory -Force | Out-Null
+$provisioningLock = [IO.File]::Open('C:\MHBox\provisioning.lock', 'OpenOrCreate', 'ReadWrite', 'None')
+. "$PSScriptRoot\WinGet.ps1" -FunctionsOnly
+if ([string]::IsNullOrWhiteSpace($env:hostVmName)) { throw 'The hostVmName machine environment variable is required.' }
+if (Test-LabReadyMarker) {
+    Write-Host 'The baseline is already complete; repairing completion tags/task cleanup only. Guests are unchanged.'
+    Connect-AzAccount -Identity -Tenant $env:tenantId -Subscription $env:subscriptionId -ErrorAction Stop | Out-Null
+    Complete-LabProvisioning
+    return
+}
+$provisioningStarted = $true
 
 $Env:MHBoxDir = 'C:\MHBox'
 $Env:MHBoxLogsDir = "$Env:MHBoxDir\Logs"
@@ -35,20 +68,9 @@ Start-Transcript -Path $logFilePath -Force
 $tenantId = $env:tenantId
 $subscriptionId = $env:subscriptionId
 $namingPrefix = $env:namingPrefix
-if (Test-Path -LiteralPath "$Env:MHBoxDir\lab-ready.json") {
-    Remove-Item -LiteralPath "$Env:MHBoxDir\lab-ready.json" -Force
-}
-if ([string]::IsNullOrWhiteSpace($env:hostVmName)) { throw 'The hostVmName machine environment variable is required.' }
 if ($namingPrefix -ne 'MHBox') { throw 'The single-RG baseline requires the nested VM prefix MHBox.' }
 $expectedVmNames = @("$namingPrefix-SQL", "$namingPrefix-Win2K22", "$namingPrefix-Ubuntu-01", "$namingPrefix-AzMigSrv")
 
-function Set-LabDeploymentTags {
-    param([hashtable]$Tags)
-    $groupId = "/subscriptions/$env:subscriptionId/resourceGroups/$env:resourceGroup"
-    foreach ($target in @($groupId, "$groupId/providers/Microsoft.Compute/virtualMachines/$env:hostVmName")) {
-        Update-AzTag -ResourceId $target -Operation Merge -Tag $Tags | Out-Null
-    }
-}
 $templateBaseUrl = [Environment]::GetEnvironmentVariable(
     'templateBaseUrl',
     [EnvironmentVariableTarget]::Machine
@@ -184,20 +206,30 @@ function Invoke-VMCommandWithRetry {
         [int]$TimeoutSeconds = 600
     )
 
-    $commandResult = $null
-    $commandResultReference = [ref]$commandResult
-    Wait-Until -Description "$Description on '$VMName'" -TimeoutSeconds $TimeoutSeconds -Condition {
-        $commandResultReference.Value = @(
-            Invoke-Command -VMName $VMName `
-                -Credential $Credential `
-                -ScriptBlock $ScriptBlock `
-                -ArgumentList $ArgumentList `
-                -ErrorAction Stop
-        )
-        return $true
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    Wait-VMCommand -VMName $VMName -Credential $Credential -TimeoutSeconds $TimeoutSeconds
+    $remaining = [int][Math]::Floor($TimeoutSeconds - $timer.Elapsed.TotalSeconds)
+    if ($remaining -le 0) { throw "No time remains for $Description on '$VMName'." }
+    $job = $null
+    try {
+        # Retry readiness, not a mutation whose acknowledgement may be lost.
+        $job = Invoke-Command -VMName $VMName -Credential $Credential `
+            -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -AsJob -ErrorAction Stop
+        if (-not (Wait-Job -Job $job -Timeout $remaining -ErrorAction Stop)) {
+            throw "$Description on '$VMName' timed out. Its execution outcome is unknown; it will not be replayed automatically."
+        }
+        $result = @(Receive-Job -Job $job -ErrorAction Stop)
+        if ($job.State -ne 'Completed') { throw "$Description on '$VMName' ended in job state '$($job.State)'." }
+        return $result
     }
-
-    return $commandResult
+    finally {
+        if ($null -ne $job) {
+            if ($job.State -notin @('Completed', 'Failed', 'Stopped')) {
+                Stop-Job -Job $job -ErrorAction Continue
+            }
+            Remove-Job -Job $job -Force -ErrorAction Continue
+        }
+    }
 }
 
 $removeWallpaperScript = {
@@ -422,66 +454,6 @@ function Set-WindowsVMComputerName {
     }
     if ($restartRequired[0]) {
         Restart-WindowsVMAndWait -VMName $VMName -Credential $Credential
-    }
-}
-
-function Invoke-LabVMConfiguration {
-    param(
-        [Parameter(Mandatory)]
-        [string]$FilePath
-    )
-
-    $wingetPath = (Get-Command winget -CommandType Application -ErrorAction Stop).Source
-    # The pinned, packaged WinGet CLI writes its diagnostics in this per-user directory.
-    $diagnosticDirectory = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir'
-    $runId = [guid]::NewGuid().ToString('N')
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        $previousLogs = @(
-            if (Test-Path -LiteralPath $diagnosticDirectory) {
-                Get-ChildItem -LiteralPath $diagnosticDirectory -Filter '*.log' -File -ErrorAction Stop |
-                    Select-Object -ExpandProperty FullName
-            }
-        )
-        Write-Host "Configuring '$FilePath' with WinGet (attempt $attempt/3; verbose logs: $diagnosticDirectory)."
-        $process = Start-Process -FilePath $wingetPath -ArgumentList @(
-            'configure', '--file', "`"$FilePath`"", '--accept-configuration-agreements',
-            '--disable-interactivity', '--verbose-logs'
-        ) -NoNewWindow -Wait -PassThru -ErrorAction Stop
-        if ($process.ExitCode -eq 0) { return }
-
-        $failure = "WinGet configuration '$FilePath' failed with exit code $($process.ExitCode)."
-        $logs = @()
-        try {
-            if (Test-Path -LiteralPath $diagnosticDirectory) {
-                $logs = @(Get-ChildItem -LiteralPath $diagnosticDirectory -Filter '*.log' -File -ErrorAction Stop |
-                    Where-Object { $_.FullName -notin $previousLogs } |
-                    ForEach-Object {
-                        $content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction Stop
-                        if ($content -match "Process:\s*winget\.exe\[$($process.Id)\]") {
-                            [pscustomobject]@{ Path = $_.FullName; Content = $content }
-                        }
-                    })
-            }
-            if ($logs.Count -eq 1) {
-                $savedLog = Join-Path $env:MHBoxLogsDir "WinGet-$runId-attempt-$attempt.log"
-                Copy-Item -LiteralPath $logs[0].Path -Destination $savedLog -ErrorAction Stop
-                Write-Host "WinGet diagnostic log saved to '$savedLog'."
-            }
-        }
-        catch {
-            throw "$failure Could not preserve diagnostic logs: $($_.Exception.Message)"
-        }
-
-        # E_FAIL alone is not safe to retry: require this process's exact pre-execution factory failure.
-        $startupFailure = $logs.Count -eq 1 -and $process.ExitCode -eq -2147467259 -and
-            $logs[0].Content -match 'ConfigurationSetProcessorFactoryRemoting\.cpp\(110\).*80004005' -and
-            $logs[0].Content -notmatch '(?im)\[(?:CONFIG|CONF)\].*\b(?:unit|Applying|ApplySet|ApplyConfigurationSet|state|progress)\b'
-        if (-not $startupFailure -or $attempt -eq 3) {
-            throw "$failure No further automatic retry; inspect the verbose WinGet diagnostics."
-        }
-        $delay = 30 * $attempt
-        Write-Warning "$failure Configuration worker initialization failed before unit execution; retrying in $delay seconds."
-        Start-Sleep -Seconds $delay
     }
 }
 
@@ -1009,10 +981,6 @@ if ($Env:flavor -eq 'ITPro') {
             }
         }
 
-        foreach ($vmName in @($SQLvmName, $Win2k22vmName, $AzMigSrvvmName)) {
-            Wait-VMCommand -VMName $vmName -Credential $winCreds
-        }
-
         Write-Host "`n### Creating VM Credentials ###`n"
         # Hard-coded username for the nested Linux VM
         $nestedLinuxUsername = 'jumpstart'
@@ -1459,7 +1427,11 @@ finally {
     Remove-Item -LiteralPath $pendingMarkerPath -Force -ErrorAction SilentlyContinue
 }
 
-# Only remove the task after the baseline has passed all readiness checks.
-Unregister-ScheduledTask -TaskName 'MHServersLogonScript' -Confirm:$false
-Set-LabDeploymentTags @{ DeploymentProgress = 'Deployment Completed'; LabReady = 'single-rg-v1' }
+# Retain the verified marker and task if publishing completion fails, so a retry only repairs handoff.
+Complete-LabProvisioning
+$provisioningStarted = $false
 Stop-Transcript
+}
+finally {
+    if ($null -ne $provisioningLock) { $provisioningLock.Dispose() }
+}

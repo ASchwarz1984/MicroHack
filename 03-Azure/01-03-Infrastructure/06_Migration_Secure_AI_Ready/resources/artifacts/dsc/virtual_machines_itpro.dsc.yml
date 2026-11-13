@@ -6,6 +6,9 @@ properties:
       id: namingPrefixStage-Win2K22
       directives:
         description: Configure VM namingPrefixStage-Win2K22
+        module: HyperVDsc
+        version: 4.0.0-preview0006
+        allowPrerelease: true
       settings:
         Name: namingPrefixStage-Win2K22
         SwitchName: 'InternalNATSwitch'
@@ -22,6 +25,9 @@ properties:
       id: namingPrefixStage-AzMigSrv
       directives:
         description: Configure VM namingPrefixStage-AzMigSrv
+        module: HyperVDsc
+        version: 4.0.0-preview0006
+        allowPrerelease: true
       settings:
         Name: namingPrefixStage-AzMigSrv
         SwitchName: 'InternalNATSwitch'
@@ -38,6 +44,9 @@ properties:
       id: namingPrefixStage-Ubuntu-01
       directives:
         description: Configure VM namingPrefixStage-Ubuntu-01
+        module: HyperVDsc
+        version: 4.0.0-preview0006
+        allowPrerelease: true
       settings:
         Name: namingPrefixStage-Ubuntu-01
         SwitchName: 'InternalNATSwitch'
