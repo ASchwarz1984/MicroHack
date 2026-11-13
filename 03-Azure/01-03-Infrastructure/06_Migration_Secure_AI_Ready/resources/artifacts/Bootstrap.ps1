@@ -256,7 +256,7 @@ if (-not (Get-Module -ListAvailable -Name Microsoft.PowerShell.PSResourceGet | W
 })) {
     Install-Module -Name Microsoft.PowerShell.PSResourceGet -RequiredVersion 1.3.1 -Scope AllUsers -Force
 }
-Import-Module -Name Microsoft.PowerShell.PSResourceGet -RequiredVersion 1.3.1 -Force
+Import-LabPSResourceGet
 foreach ($module in ([ordered]@{
     'Az.Accounts' = '5.5.4'
     'Az.Resources' = '10.2.2'

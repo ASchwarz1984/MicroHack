@@ -13,6 +13,15 @@ function Test-LabReadyMarker {
     return $true
 }
 
+function Import-LabPSResourceGet {
+    $module = Get-Module -ListAvailable -Name Microsoft.PowerShell.PSResourceGet | Where-Object {
+        $_.Version -eq [version]'1.3.1' -and -not $_.PrivateData.PSData.Prerelease
+    } | Select-Object -First 1
+    if (-not $module) { throw 'Required module Microsoft.PowerShell.PSResourceGet 1.3.1 (stable) is not installed.' }
+    # Name-based version resolution can load the bundled DLL before checking its version.
+    Import-Module -Name $module.Path -Global -ErrorAction Stop
+}
+
 function Install-LabPSResource {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -140,6 +149,7 @@ Start-Transcript -Path $logFilePath -Force
 
 $DeploymentProgressString = "Installing WinGet packages..."
 
+Import-LabPSResourceGet
 Connect-AzAccount -Identity -Tenant $tenantId -Subscription $subscriptionId
 
 if ([string]::IsNullOrWhiteSpace($env:hostVmName)) { throw 'The hostVmName machine environment variable is required.' }
@@ -153,7 +163,6 @@ $winGetVersion = '1.29.380'
 if (@(Get-Module -Name Microsoft.WinGet.Client | Where-Object Version -NE ([version]$winGetVersion)).Count -gt 0) {
     throw "Run WinGet.ps1 in a fresh PowerShell 7 process; another WinGet client version is already loaded."
 }
-Import-Module -Name Microsoft.PowerShell.PSResourceGet -RequiredVersion 1.3.1 -Force
 Install-LabPSResource -Name Microsoft.WinGet.Client -Version $winGetVersion
 Install-LabPSResource -Name Microsoft.WinGet.DSC -Version $winGetVersion
 Import-Module -Name Microsoft.WinGet.Client -RequiredVersion $winGetVersion -Force
